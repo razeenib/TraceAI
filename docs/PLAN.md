@@ -77,6 +77,7 @@ struct TrackerOutput: @unchecked Sendable {
     let frameSize: CGSize                      // upright frame size in pixels
 }
 final class VisionTracker: @unchecked Sendable {
+    init()
     func process(_ buffer: CVPixelBuffer, trackPaper: Bool, maskHands: Bool) -> TrackerOutput // video queue only
     func reset()                                                                             // clears EMA state
     static func warpStencil(_ stencil: UIImage, to quad: PaperQuad, canvasSize: CGSize) -> UIImage?
@@ -92,7 +93,8 @@ final class VisionTracker: @unchecked Sendable {
     var isHandOcclusionEnabled: Bool           // didSet → engine
     private(set) var trackedPaperQuad: PaperQuad?   // frozen while isLocked
     private(set) var handMaskImage: CGImage?
-    private(set) var frameSize: CGSize              // canvasSize for warpStencil
+    private(set) var frameSize: CGSize              // canvasSize for warpStencil; set at configure time
+    init()
     func attachPreview(_ layer: AVCaptureVideoPreviewLayer)
     func start() async                         // asks permission, configures, starts
     func stop()
@@ -102,13 +104,17 @@ final class VisionTracker: @unchecked Sendable {
 struct CameraPreview: UIViewRepresentable { let controller: CameraController }
 
 // TraceAIApp.swift
-struct TraceSession: Identifiable { let id = UUID(); let stencil: StencilSet }
+struct TraceSession: Identifiable { let id = UUID(); let stencil: StencilSet }   // init(stencil:)
+
+// HomeView.swift
+struct HomeView: View {}                        // no parameters: HomeView()
 
 // TracingView.swift
-struct TracingView: View { let stencil: StencilSet }
+struct TracingView: View { let stencil: StencilSet }   // init(stencil:) only; closes itself via @Environment(\.dismiss)
 ```
+Initializers are exactly the ones shown (memberwise where not written). Don't add parameters, closures or bindings to them.
 Swift 6 rules:
-- `AVCaptureSession`, `AVCaptureDevice` and the video delegate live in a private `final class CaptureEngine: @unchecked Sendable` that has its own serial queues. Its flags are guarded by an `OSAllocatedUnfairLock`.
+- `AVCaptureSession`, `AVCaptureDevice` and the video delegate live in a private `final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable` (the delegate protocol requires `NSObjectProtocol`) that has its own serial queues. Its flags are guarded by an `OSAllocatedUnfairLock`.
 - `CameraController` (on MainActor) only calls the engine and publishes the state.
 - Shared `CIContext`s are `nonisolated(unsafe) static let` if the compiler complains.
 
@@ -175,11 +181,11 @@ Run everything in `Task.detached(priority: .userInitiated)` with one shared `CIC
   - `AVCaptureVideoDataOutput`: `kCVPixelFormatType_32BGRA`, `alwaysDiscardsLateVideoFrames = true`, delegate on `videoQueue`.
   - Data-output connection `videoRotationAngle = 90` (upright portrait buffers). Check `isVideoRotationAngleSupported` before setting it.
 - **Frame gate** in `captureOutput`. Return immediately when:
-  - both flags are off,
-  - less than 1/15 s has passed since the last processed frame,
-  - the previous frame is still processing.
+  - both flags are off, or
+  - less than 1/15 s has passed since the last processed frame (1/10 s when `ProcessInfo.thermalState >= .serious`).
 
-  When `ProcessInfo.thermalState >= .serious`, drop to 10 fps.
+  No "still processing" flag is needed: delegate callbacks are serialized on `videoQueue` and late frames are discarded.
+- **`frameSize` early:** set it during configuration from `device.activeFormat.formatDescription` dimensions, with width and height swapped for the 90° rotation. It's then never `.zero` when Auto-Snap is first turned on.
 - **Per frame:** `tracker.process(buffer, trackPaper: paperOn && !locked, maskHands: handOn)`, then hop to MainActor and set:
   - `trackedPaperQuad`: only while unlocked, so **Lock freezes the last anchor** even if an arm covers a corner.
   - `handMaskImage` and `frameSize`.
@@ -249,7 +255,7 @@ Create the request objects and one `CIContext` once, and reuse them every frame.
   - When locked: `.gesture(…, including: .none)` and `.allowsHitTesting(false)`.
 - **Current image:** for Pro, `layers[step-1]` (default step 3). Otherwise `full`.
 - **Fallback screens:** `.unauthorized` shows an explanation and an "Open Settings" button. `.unavailable` shows a message.
-- **Top bar:** close button, plus reset-alignment (hidden while locked).
+- **Top bar:** close button that calls `@Environment(\.dismiss) private var dismiss` (no `onClose` closure; Phase 5 presents with `.fullScreenCover`), plus reset-alignment (hidden while locked).
 - **TracingDock** (`.ultraThinMaterial`):
   - Opacity `Slider(0.1...1.0)`.
   - Segmented picker 1–4 with the stage name under it. Not Pro: the picker is disabled and covered by the "Unlock 4-Step AI Breakdown" button.

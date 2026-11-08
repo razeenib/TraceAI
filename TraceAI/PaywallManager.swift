@@ -23,21 +23,26 @@ final class PaywallManager {
 
     private(set) var isPro: Bool
 
+    /// DEBUG-only unlock; kept in memory, never persisted.
+    private var debugUnlocked = false
+
     private init() {
         isPro = UserDefaults.standard.bool(forKey: Self.isProKey)
     }
 
-    private func setPro(_ value: Bool) {
-        guard isPro != value else { return }
-        isPro = value
+    /// Persists the real StoreKit entitlement; `isPro` also honors the DEBUG unlock.
+    private func setEntitlement(_ value: Bool) {
         UserDefaults.standard.set(value, forKey: Self.isProKey)
+        let newValue = value || debugUnlocked
+        if isPro != newValue { isPro = newValue }
     }
 
     func triggerPaywall(placement: String) {
         // TODO(Superwall): Superwall.shared.register(placement:)
         #if DEBUG
         Self.logger.debug("Paywall '\(placement, privacy: .public)' (DEBUG): unlocking Pro")
-        setPro(true)
+        debugUnlocked = true
+        isPro = true
         #else
         Self.logger.info("Paywall '\(placement, privacy: .public)' requested; Superwall not wired yet")
         #endif
@@ -48,13 +53,16 @@ final class PaywallManager {
         await refreshEntitlements()
     }
 
+    /// Recomputes Pro from StoreKit, so refunds and lapsed subscriptions turn it off.
     func refreshEntitlements() async {
+        var found = false
         for await result in Transaction.currentEntitlements {
             guard case .verified(let transaction) = result,
                   transaction.revocationDate == nil,
                   proProductIDs.contains(transaction.productID) else { continue }
-            setPro(true)
-            return
+            found = true
+            break
         }
+        setEntitlement(found)
     }
 }

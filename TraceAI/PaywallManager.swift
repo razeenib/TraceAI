@@ -1,5 +1,7 @@
 import Foundation
 import Observation
+import OSLog
+import StoreKit
 
 enum PaywallPlacement {
     static let unlockLayers = "unlock_4_step_breakdown"
@@ -9,14 +11,50 @@ enum PaywallPlacement {
 final class PaywallManager {
     static let shared = PaywallManager()
 
-    private(set) var isPro: Bool = false
+    private static let isProKey = "isPro"
+    private static let logger = Logger(subsystem: "TraceAI", category: "Paywall")
 
-    private init() {}
+    /// Placeholder product IDs; replace with the real App Store Connect IDs.
+    let proProductIDs: Set<String> = [
+        "com.traceai.pro.weekly",
+        "com.traceai.pro.yearly",
+        "com.traceai.pro.lifetime",
+    ]
 
-    // STUB (Phase 0). Phase 1 adds StoreKit 2 entitlements and the Superwall hook.
-    func triggerPaywall(placement: String) {}
+    private(set) var isPro: Bool
 
-    func restorePurchases() async {}
+    private init() {
+        isPro = UserDefaults.standard.bool(forKey: Self.isProKey)
+    }
 
-    func refreshEntitlements() async {}
+    private func setPro(_ value: Bool) {
+        guard isPro != value else { return }
+        isPro = value
+        UserDefaults.standard.set(value, forKey: Self.isProKey)
+    }
+
+    func triggerPaywall(placement: String) {
+        // TODO(Superwall): Superwall.shared.register(placement:)
+        #if DEBUG
+        Self.logger.debug("Paywall '\(placement, privacy: .public)' (DEBUG): unlocking Pro")
+        setPro(true)
+        #else
+        Self.logger.info("Paywall '\(placement, privacy: .public)' requested; Superwall not wired yet")
+        #endif
+    }
+
+    func restorePurchases() async {
+        try? await AppStore.sync()
+        await refreshEntitlements()
+    }
+
+    func refreshEntitlements() async {
+        for await result in Transaction.currentEntitlements {
+            guard case .verified(let transaction) = result,
+                  transaction.revocationDate == nil,
+                  proProductIDs.contains(transaction.productID) else { continue }
+            setPro(true)
+            return
+        }
+    }
 }

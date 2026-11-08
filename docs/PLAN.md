@@ -150,10 +150,10 @@ Swift 6 rules:
 
 ## Phase 3: StencilProcessor.swift (~180 lines, hardest so far; strongest model)
 Run everything in `Task.detached(priority: .userInitiated)` with one shared `CIContext`.
-1. **Normalize:**
-   - `CIImage(image: uiImage, options: [.applyOrientationProperty: true])`.
-   - If a portrait photo still comes out rotated on a device, add `.oriented(CGImagePropertyOrientation(uiImage.imageOrientation))`.
-   - Downscale so the long side is at most 1600 px (`CILanczosScaleTransform`).
+1. **Normalize (orientation + size in one pass):**
+   - Redraw the photo upright with `UIGraphicsImageRenderer`, long side at most 1600 px, `format.scale = 1`. `draw(in:)` applies `imageOrientation`.
+   - Then `CIImage(cgImage:)` on the result.
+   - Don't use `.applyOrientationProperty`: it ignores `UIImage.imageOrientation`. `CGImagePropertyOrientation(UIImage.Orientation)` isn't in the SDK.
 2. **Remove background:**
    - Run `VNGenerateForegroundInstanceMaskRequest`. If a subject is found, build a mask with `generateScaledMaskForImage(forInstances: allInstances, from:)` and place the subject on white with `CIBlendWithMask`.
    - If nothing is found or the request throws, keep the original image. Never fail here.
@@ -162,7 +162,7 @@ Run everything in `Task.detached(priority: .userInitiated)` with one shared `CIC
    - `.clampedToExtent()` → `CIGaussianBlur` → `CILineOverlay` → `.cropped(to: source.extent)`.
    - Pass all 5 `CILineOverlay` parameters explicitly: `inputNRNoiseLevel 0.02`, `inputNRSharpness 0.71`, `inputEdgeIntensity 1.0`, `inputThreshold threshold`, `inputContrast 50.0`.
    - The layers:
-     - **L1 Shapes:** blur 10, threshold 0.3, plus the silhouette outline: `CIMorphologyGradient` on the mask → `CIMaskToAlpha` → **black-ink matrix**.
+     - **L1 Shapes:** `lines(blur: 10, threshold: 0.3)`. Only if Step 2 produced a mask, composite the silhouette outline over it: `CIMorphologyGradient` (`inputRadius 3`) on the mask → `CIMaskToAlpha` → **black-ink matrix**. With no mask, L1 is just the lines.
      - **L2 Outlines:** blur 4, threshold 0.15.
      - **L3 Details:** blur 0, threshold 0.1.
      - **L4 Shading:** `CIColorPosterize` (4 levels) → `CIColorInvert` → `CIMaskToAlpha` → black-ink matrix with `aVector (0,0,0,0.35)`.
@@ -184,10 +184,11 @@ Run everything in `Task.detached(priority: .userInitiated)` with one shared `CIC
   - `trackedPaperQuad`: only while unlocked, so **Lock freezes the last anchor** even if an arm covers a corner.
   - `handMaskImage` and `frameSize`.
   - Turning a toggle off clears its value. Turning paper tracking on calls `tracker.reset()`.
-- **`attachPreview(layer)`:** `layer.session = engine.session`, `.resizeAspectFill`, and the preview connection rotated to 90.
+- **`attachPreview(layer)`:** `layer.session = engine.session`, `.resizeAspectFill`. Keep a reference to the layer.
 - **`start()`:**
   - Ask camera permission. Denied → `.unauthorized`; no device → `.unavailable`.
   - Otherwise configure, `startRunning` on `sessionQueue`, and set `.running`.
+- **Preview rotation:** set `videoRotationAngle = 90` on `previewLayer.connection` (guarded by `isVideoRotationAngleSupported(90)`) in **both** `attachPreview` and after `commitConfiguration()` in `start()`. The connection may not exist yet when the view mounts.
 - **`setTorch`:** check `hasTorch`, then `lockForConfiguration` and set `torchMode`.
 - **`setFocusExposureLocked(true)`:**
   - `focusMode = .locked` and `exposureMode = .locked`, each guarded by `is…ModeSupported`.
@@ -201,15 +202,20 @@ Create the request objects and one `CIContext` once, and reuse them every frame.
 1. **Paper Corner Auto-Tracking:** `VNDetectDocumentSegmentationRequest`.
    - Take the first `VNRectangleObservation` with confidence ≥ 0.6. Flip Vision's bottom-left origin to top-left (`y = 1 − y`).
    - Smooth each corner with an EMA: `s += 0.25 × (new − s)`.
+   - **Deadband:** if all 4 corners of the new EMA value moved less than `0.002` from the current smoothed quad, return the current quad unchanged. A stationary phone then yields an equal `PaperQuad`, so `.task(id:)` doesn't re-fire.
    - If detection is lost, keep the last quad for 10 frames, then return nil.
    - `warpStencil(_:to:canvasSize:)`:
-     - Fit the stencil's aspect inside the paper so it doesn't stretch: compute an inset rect in the unit square and map its 4 corners into the quad bilinearly.
+     - Fit the stencil's aspect inside the paper so it doesn't stretch. The unit square is paper space, not a 1:1 square:
+       - Estimate the paper aspect in pixels: mean of the top and bottom edge lengths ÷ mean of the left and right edge lengths, each scaled by `canvasSize`.
+       - Fit `stencil.size`'s aspect against that paper aspect to get an inset rect in `[0,1]²`.
+       - Map the inset rect's 4 corners into the quad bilinearly.
      - Convert to pixels in `canvasSize` with CI's bottom-left origin (`y = (1 − y) × h`).
      - `CIFilter.perspectiveTransform()` → composite over a clear canvas → crop to the canvas rect → render to `UIImage`.
-2. **Hand Occlusion:** `VNGeneratePersonInstanceMaskRequest`.
-   - `generateScaledMaskForImage(forInstances: allInstances, from:)` gives the mask.
-   - Downscale the frame to at most 960 px on the long side, then `CIBlendWithMask(input: frame, background: clear, mask)` → a `CGImage` of the hand pixels only. No person → nil.
-   - If it runs under 15 fps or misses a bare hand on the device, swap in `VNGeneratePersonSegmentationRequest` (`.balanced`). The output stays the same.
+2. **Hand Occlusion:** `VNGeneratePersonSegmentationRequest` (`qualityLevel = .balanced`, `outputPixelFormat = kCVPixelFormatType_OneComponent8`).
+   - Use segmentation, not the instance-mask request: when the phone points down at the desk, only a hand and forearm are in frame, and the instance model often finds 0 people.
+   - The mask buffer comes out smaller than the frame. Downscale the frame to at most 960 px on the long side, then scale the mask with `CGAffineTransform(scaleX: frame.width / mask.width, y: frame.height / mask.height)` so both have the **same extent** before blending.
+   - `CIBlendWithMask(input: frame, background: clear, mask)` → a `CGImage` of the hand pixels only.
+   - If the mask is empty (max value under about 0.1, found with `CIAreaMaximum` on a small downsample), return nil.
 3. **`reset()`** clears the EMA and lost-frame counters.
 
 ## Phase 5: TraceAIApp.swift + HomeView.swift (~150 lines)
@@ -226,17 +232,20 @@ Create the request objects and one `CIContext` once, and reuse them every frame.
 - **Layer stack, bottom to top:**
   1. `CameraPreview`
   2. Stencil
-  3. Hand mask: `Image(decorative:)`, `.resizable().scaledToFill()`, same full-screen frame as the preview, `.allowsHitTesting(false)`, so the lines sit *under* your fingers and pencil
+  3. Hand mask: `Image(decorative:)`, `.allowsHitTesting(false)`, so the lines sit *under* your fingers and pencil
   4. Top bar
   5. Dock
+- **No layout blowout:** the camera frame is 9:16, the screen about 9:19.5, so a bare `.scaledToFill()` image widens the `ZStack` and pushes the top bar and dock off-screen. Every full-screen camera-space image (snapped stencil, hand mask) goes in a `GeometryReader` with `.resizable().scaledToFill().frame(width: geo.size.width, height: geo.size.height).clipped()`. Inside a `.overlay` on `CameraPreview` also works.
 - **Stencil, snapped:** when Auto-Snap is on and a quad exists:
-  - Show `VisionTracker.warpStencil(current, to: quad, canvasSize: camera.frameSize)` full-screen with `.scaledToFill()`.
-  - Compute it in `.task(id: quad)` off the main thread, never inside `body`.
+  - Show the warped stencil full-screen with the clipped `scaledToFill` rule above.
+  - Compute it in `.task(id: quad)` with `await Task.detached(priority: .userInitiated) { VisionTracker.warpStencil(img, to: quad, canvasSize: half) }.value`. A plain call inside `.task` would run on the main actor.
+  - `half` = `camera.frameSize` × 0.5 (long side about 960 px), which keeps memory churn down.
   - Manual gestures are off while snapped.
   - If this stutters on the device, switch to `.projectionEffect` with a homography, which needs no re-render.
 - **Stencil, manual:**
   - Modifiers in strict order: `.scaleEffect` → `.rotationEffect` → `.offset`.
   - `MagnifyGesture` ⊕ `RotateGesture` ⊕ `DragGesture(minimumDistance: 10)`, applied at the same time. Commit the values when the gesture ends.
+  - **No pinch-end jump:** while a magnify or rotate gesture is active, ignore drag translation. When the pinch or rotate ends and the drag continues, re-baseline the drag to its current translation so the lifted finger doesn't shift the stencil.
   - When locked: `.gesture(…, including: .none)` and `.allowsHitTesting(false)`.
 - **Current image:** for Pro, `layers[step-1]` (default step 3). Otherwise `full`.
 - **Fallback screens:** `.unauthorized` shows an explanation and an "Open Settings" button. `.unavailable` shows a message.

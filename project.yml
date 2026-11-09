@@ -6,6 +6,11 @@ options:
     iOS: "17.0"
   createIntermediateGroups: true
 
+packages:
+  SuperwallKit:
+    url: https://github.com/superwall/Superwall-iOS
+    exactVersion: 4.19.1
+
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -20,6 +25,8 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: TraceAI
+    dependencies:
+      - package: SuperwallKit
     scheme: {}
     settings:
       base:

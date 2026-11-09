@@ -10,7 +10,6 @@ struct TracingView: View {
 
     @State private var opacity: Double = 0.6
     @State private var step = 3
-    @State private var snapped: UIImage?
     @State private var pausedInBackground = false
 
     // Committed manual transform.
@@ -24,8 +23,6 @@ struct TracingView: View {
     // Drag offset, re-baselined while a pinch or rotate is active so lifting a finger doesn't jump.
     @State private var dragBase: CGSize = .zero
     @State private var dragOffset: CGSize = .zero
-
-    private struct SnapKey: Equatable { let quad: PaperQuad?; let layer: Int }
 
     private var isPro: Bool { PaywallManager.shared.isPro }
 
@@ -57,7 +54,6 @@ struct TracingView: View {
         }
         .background(Color.black.ignoresSafeArea())
         .environment(\.colorScheme, .dark)
-        .task(id: SnapKey(quad: snapQuad, layer: isPro ? step : 0)) { await updateSnappedStencil() }
         .onChange(of: isDragging) { _, dragging in if !dragging { commitDrag() } }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
         .task { await camera.start() }
@@ -77,8 +73,8 @@ struct TracingView: View {
             CameraPreview(controller: camera)
                 .ignoresSafeArea()
             Group {
-                if snapQuad != nil {
-                    if let snapped { cameraSpace(Image(uiImage: snapped)) }
+                if let quad = snapQuad {
+                    snappedStencil(quad)
                 } else {
                     manualStencil
                 }
@@ -95,6 +91,24 @@ struct TracingView: View {
         GeometryReader { geo in
             image.resizable().scaledToFill()
                 .frame(width: geo.size.width, height: geo.size.height).clipped()
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+
+    /// Stencil pinned to the paper by a homography: the GPU warps the full-resolution image,
+    /// so it stays sharp and a moving quad costs no re-render.
+    private func snappedStencil(_ quad: PaperQuad) -> some View {
+        let image = currentImage
+        return GeometryReader { geo in
+            let fit = min(geo.size.width / max(image.size.width, 1), geo.size.height / max(image.size.height, 1))
+            let size = CGSize(width: image.size.width * fit, height: image.size.height * fit)
+            if let transform = SnapProjection.transform(quad: quad, viewSize: size,
+                                                        frameSize: camera.frameSize, containerSize: geo.size) {
+                Image(uiImage: image).resizable()
+                    .frame(width: size.width, height: size.height)
+                    .projectionEffect(transform)
+            }
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)
@@ -146,18 +160,6 @@ struct TracingView: View {
         withAnimation(.snappy) {
             scale = 1; angle = .zero; offset = .zero; dragOffset = .zero; dragBase = .zero
         }
-    }
-
-    private func updateSnappedStencil() async {
-        guard let quad = snapQuad else { snapped = nil; return }
-        let image = currentImage
-        let half = CGSize(width: camera.frameSize.width * 0.5, height: camera.frameSize.height * 0.5)
-        guard half.width >= 1, half.height >= 1 else { return }
-        let warped = await Task.detached(priority: .userInitiated) {
-            VisionTracker.warpStencil(image, to: quad, canvasSize: half)
-        }.value
-        guard !Task.isCancelled else { return }
-        snapped = warped
     }
 
     private var topBar: some View {

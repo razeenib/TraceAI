@@ -33,6 +33,7 @@ The work is split into small phases. Each phase runs in a fresh session, reads o
     HomeView.swift                picker, samples, unlock card          (Phase 5)
     TracingView.swift             layer stack + gestures                (Phase 6)
     TracingDock.swift             bottom dock controls                  (Phase 6)
+    SnapProjection.swift          homography for the snapped stencil    (Phase 6)
     PrivacyInfo.xcprivacy
 ```
 
@@ -208,7 +209,7 @@ Create the request objects and one `CIContext` once, and reuse them every frame.
 1. **Paper Corner Auto-Tracking:** `VNDetectDocumentSegmentationRequest`.
    - Take the first `VNRectangleObservation` with confidence ≥ 0.6. Flip Vision's bottom-left origin to top-left (`y = 1 − y`).
    - Smooth each corner with an EMA: `s += 0.25 × (new − s)`.
-   - **Deadband:** if all 4 corners of the new EMA value moved less than `0.002` from the current smoothed quad, return the current quad unchanged. A stationary phone then yields an equal `PaperQuad`, so `.task(id:)` doesn't re-fire.
+   - **Deadband:** if all 4 corners of the new EMA value moved less than `0.001` from the current smoothed quad, return the current quad unchanged, so a stationary phone doesn't make the stencil shimmer.
    - If detection is lost, keep the last quad for 10 frames, then return nil.
    - `warpStencil(_:to:canvasSize:)`:
      - Fit the stencil's aspect inside the paper so it doesn't stretch. The unit square is paper space, not a 1:1 square:
@@ -243,11 +244,10 @@ Create the request objects and one `CIContext` once, and reuse them every frame.
   5. Dock
 - **No layout blowout:** the camera frame is 9:16, the screen about 9:19.5, so a bare `.scaledToFill()` image widens the `ZStack` and pushes the top bar and dock off-screen. Every full-screen camera-space image (snapped stencil, hand mask) goes in a `GeometryReader` with `.resizable().scaledToFill().frame(width: geo.size.width, height: geo.size.height).clipped()`. Inside a `.overlay` on `CameraPreview` also works.
 - **Stencil, snapped:** when Auto-Snap is on and a quad exists:
-  - Show the warped stencil full-screen with the clipped `scaledToFill` rule above.
-  - Compute it in `.task(id: quad)` with `await Task.detached(priority: .userInitiated) { VisionTracker.warpStencil(img, to: quad, canvasSize: half) }.value`. A plain call inside `.task` would run on the main actor.
-  - `half` = `camera.frameSize` × 0.5 (long side about 960 px), which keeps memory churn down.
+  - Show the stencil `Image` at full resolution with `.projectionEffect(SnapProjection.transform(…))` (`SnapProjection.swift`): a homography from the view rect to the paper quad in screen points. The GPU does the warp, so it stays sharp and a moving quad needs no re-render.
+  - `SnapProjection` maps the quad from the camera frame to the screen with the same aspect-fill as the preview, and aspect-fits the stencil inside the paper.
   - Manual gestures are off while snapped.
-  - If this stutters on the device, switch to `.projectionEffect` with a homography, which needs no re-render.
+  - `VisionTracker.warpStencil` stays in the contract but is no longer called by the tracing screen.
 - **Stencil, manual:**
   - Modifiers in strict order: `.scaleEffect` → `.rotationEffect` → `.offset`.
   - `MagnifyGesture` ⊕ `RotateGesture` ⊕ `DragGesture(minimumDistance: 10)`, applied at the same time. Commit the values when the gesture ends.

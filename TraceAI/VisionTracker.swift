@@ -180,7 +180,7 @@ final class VisionTracker: @unchecked Sendable {
 
 private struct PaperState: Sendable {
     static let emaAlpha: CGFloat = 0.25
-    static let deadband: CGFloat = 0.002
+    static let deadband: CGFloat = 0.001
     static let maxLostFrames = 10
 
     var smoothed: PaperQuad?
